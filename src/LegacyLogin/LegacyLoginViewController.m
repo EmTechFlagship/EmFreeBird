@@ -1,8 +1,13 @@
 #import "LegacyLoginViewController.h"
 #import <WebKit/WebKit.h>
+#import <arpa/inet.h>
 #import <dlfcn.h>
+#import <ifaddrs.h>
+#import <net/if.h>
+#import <netinet/in.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
+#import <sys/socket.h>
 #import "Core/BHTBundle.h"
 #import "Headers/TFNHeaders.h"
 
@@ -138,6 +143,150 @@ static void SwitchToAccount(id account) {
     }
 }
 
+#pragma mark - Error parsing / localization helpers
+
+// Best-effort localization lookup: own bundle first, then Twitter's bundle,
+// then the supplied fallback (so a renamed/missing Twitter key never leaks
+// a raw key like "OK_ACTION_LABEL" into the UI, as seen in the login alert).
+static NSString* BHTLocalized(NSString* key, NSString* fallback) {
+    NSString* s = [[BHTBundle sharedBundle] localizedStringForKey:key];
+    if (s.length && ![s isEqualToString:key]) {
+        return s;
+    }
+    s = [[BHTBundle sharedBundle] localizedTwitterStringForKey:key];
+    if (s.length && ![s isEqualToString:key]) {
+        return s;
+    }
+    return fallback;
+}
+
+static void CollectAPIError(id obj, long* outCode, NSString** outMessage, int depth) {
+    if (!obj || depth > 4 || (!outCode && !outMessage)) {
+        return;
+    }
+
+    if ([obj isKindOfClass:[NSError class]]) {
+        NSError* e = obj;
+        CollectAPIError(e.userInfo, outCode, outMessage, depth + 1);
+        return;
+    }
+
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        NSDictionary* dict = obj;
+        for (id key in dict) {
+            id value = dict[key];
+            NSString* keyStr = [key isKindOfClass:[NSString class]] ? key : [key description];
+            NSString* lower = [keyStr lowercaseString];
+            if (outCode && *outCode == 0 &&
+                ([lower containsString:@"apierrorcode"] || [lower containsString:@"errorcode"])) {
+                if ([value respondsToSelector:@selector(integerValue)]) {
+                    long v = [value integerValue];
+                    if (v != 0) {
+                        *outCode = v;
+                    }
+                }
+            }
+            if (outMessage && !*outMessage &&
+                ([lower containsString:@"apierrormessage"] ||
+                 [lower containsString:@"errormessage"] ||
+                 [lower isEqualToString:@"message"])) {
+                if ([value isKindOfClass:[NSString class]] && ((NSString*)value).length) {
+                    *outMessage = value;
+                }
+            }
+        }
+        for (id value in [dict allValues]) {
+            if ((outCode && *outCode != 0) && (outMessage && *outMessage)) {
+                break;
+            }
+            if ([value isKindOfClass:[NSDictionary class]] ||
+                [value isKindOfClass:[NSArray class]] ||
+                [value isKindOfClass:[NSError class]]) {
+                CollectAPIError(value, outCode, outMessage, depth + 1);
+            }
+        }
+        return;
+    }
+
+    if ([obj isKindOfClass:[NSArray class]]) {
+        for (id value in (NSArray*)obj) {
+            if ((outCode && *outCode != 0) && (outMessage && *outMessage)) {
+                break;
+            }
+            CollectAPIError(value, outCode, outMessage, depth + 1);
+        }
+    }
+}
+
+static long HTTPStatus(id error) {
+    if ([error isKindOfClass:[NSError class]]) {
+        return (long)((NSError*)error).code;
+    }
+    return 0;
+}
+
+#pragma mark - LocalDevVPN (jkcoxson) helpers
+
+// LocalDevVPN's documented URL interface (jkcoxson/LocalDevVPN,
+// LocalDevVPNApp.swift -handleURL:): localdevvpn://enable?scheme=<callback>
+// starts the loopback tunnel, then bounces back to the caller's scheme.
+// The host app answers to twitter://, so pass that as the callback.
+static NSString* const kLocalDevVPNEnableURL = @"localdevvpn://enable?scheme=twitter";
+static NSString* const kLocalDevVPNAppURL = @"localdevvpn://";
+static NSString* const kLocalDevVPNAppStoreURL =
+    @"https://apps.apple.com/us/app/localdevvpn/id6755608044";
+static NSString* const kLocalDevVPNRepoURL = @"https://github.com/jkcoxson/LocalDevVPN";
+static NSString* const kVPNPreflightSkipKey = @"bht_login_vpn_preflight_skipped";
+
+typedef NS_ENUM(NSInteger, BHTVPNStatus) {
+    BHTVPNStatusOff = 0,      // no utun tunnel up
+    BHTVPNStatusOther = 1,    // some VPN tunnel up, but not LocalDevVPN's 10.7.x.x
+    BHTVPNStatusLocalDev = 2, // LocalDevVPN's default 10.7.0.1/10.7.1.1 pair seen
+};
+
+// No VPN entitlement needed: a connected tunnel always shows up as a running
+// utun interface. LocalDevVPN defaults to 10.7.1.1/32 (iface) + 10.7.0.1/32
+// (peer), so an up utun carrying 10.7.x.x is almost certainly it.
+static BHTVPNStatus LocalDevVPNStatus(void) {
+    struct ifaddrs* addrs = NULL;
+    if (getifaddrs(&addrs) != 0) {
+        return BHTVPNStatusOff;
+    }
+
+    BOOL anyTunnel = NO;
+    BOOL localDev = NO;
+    for (struct ifaddrs* cur = addrs; cur; cur = cur->ifa_next) {
+        if (!cur->ifa_name || !cur->ifa_addr) {
+            continue;
+        }
+        if (strncmp(cur->ifa_name, "utun", 4) != 0) {
+            continue;
+        }
+        if (!(cur->ifa_flags & IFF_UP) || !(cur->ifa_flags & IFF_RUNNING)) {
+            continue;
+        }
+        if (cur->ifa_addr->sa_family != AF_INET) {
+            continue;
+        }
+        anyTunnel = YES;
+
+        char buf[INET_ADDRSTRLEN] = {0};
+        struct sockaddr_in* sin = (struct sockaddr_in*)cur->ifa_addr;
+        if (inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf))) {
+            if (strncmp(buf, "10.7.", 5) == 0) {
+                localDev = YES;
+                break;
+            }
+        }
+    }
+    freeifaddrs(addrs);
+
+    if (localDev) {
+        return BHTVPNStatusLocalDev;
+    }
+    return anyTunnel ? BHTVPNStatusOther : BHTVPNStatusOff;
+}
+
 #pragma mark - ui_metrics injection
 
 // Hooks fetch/XHR/sendBeacon inside the js_inst page and forwards the requested URLs,
@@ -161,12 +310,18 @@ static NSString* const kJSInstJS =
 @property (nonatomic, strong) UITextField* passField;
 @property (nonatomic, strong) UIButton* actionButton;
 @property (nonatomic, strong) UILabel* infoLabel;
+@property (nonatomic, strong) UILabel* vpnStatusLabel;
+@property (nonatomic, strong) UIButton* vpnButton;
 @property (nonatomic, strong) TFNHUD* hud;
 
 @property (nonatomic, strong) WKWebView* instWebView;
 @property (nonatomic, copy) NSString* uiMetrics;
 @property (nonatomic, copy) void (^metricsCallback)(NSString*);
 @property (nonatomic, assign) BOOL metricsDone;
+
+// Set once the user passes the VPN preflight (or the tunnel is up), so
+// explicit retries from error alerts don't re-show the nudge each time.
+@property (nonatomic, assign) BOOL vpnPreflightPassed;
 
 @property (nonatomic, assign) BOOL asRootScreen; // YES when installed as the signed-out screen
 
@@ -259,7 +414,23 @@ static NSString* const kJSInstJS =
                           action:@selector(actionTapped)
                 forControlEvents:UIControlEventTouchUpInside];
 
-    NSArray* fields = @[self.infoLabel, self.userField, self.passField, self.actionButton];
+    self.vpnStatusLabel = [self label:@""];
+    self.vpnStatusLabel.font = [UIFont systemFontOfSize:13];
+
+    self.vpnButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.vpnButton setTitle:BHTLocalized(@"LEGACY_LOGIN_VPN_CONNECT_BUTTON",
+                                          @"Connect via LocalDevVPN")
+                    forState:UIControlStateNormal];
+    self.vpnButton.titleLabel.font = [UIFont systemFontOfSize:15];
+    self.vpnButton.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeading;
+    self.vpnButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.vpnButton addTarget:self
+                       action:@selector(vpnButtonTapped)
+             forControlEvents:UIControlEventTouchUpInside];
+
+    NSArray* fields =
+        @[self.infoLabel, self.vpnStatusLabel, self.vpnButton, self.userField, self.passField,
+          self.actionButton];
     UIStackView* stack = [[UIStackView alloc] initWithArrangedSubviews:fields];
     stack.axis = UILayoutConstraintAxisVertical;
     stack.spacing = 14;
@@ -302,6 +473,139 @@ static NSString* const kJSInstJS =
 }
 
 #pragma mark - Actions
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(refreshVPNStatus)
+                                                 name:UIApplicationDidBecomeActiveNotification
+                                               object:nil];
+    [self refreshVPNStatus];
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+    [[NSNotificationCenter defaultCenter] removeObserver:self
+                                                    name:UIApplicationDidBecomeActiveNotification
+                                                  object:nil];
+}
+
+- (void)refreshVPNStatus {
+    if (!self.vpnStatusLabel) {
+        return;
+    }
+    switch (LocalDevVPNStatus()) {
+        case BHTVPNStatusLocalDev:
+            self.vpnStatusLabel.text = BHTLocalized(
+                @"LEGACY_LOGIN_VPN_STATUS_CONNECTED",
+                @"LocalDevVPN: connected — login will go through the tunnel.");
+            self.vpnStatusLabel.textColor = [UIColor systemGreenColor];
+            [self.vpnButton setTitle:BHTLocalized(@"LEGACY_LOGIN_VPN_OPEN_BUTTON", @"Open LocalDevVPN")
+                            forState:UIControlStateNormal];
+            break;
+        case BHTVPNStatusOther:
+            self.vpnStatusLabel.text = BHTLocalized(@"LEGACY_LOGIN_VPN_STATUS_OTHER",
+                                                    @"VPN: connected (not LocalDevVPN).");
+            self.vpnStatusLabel.textColor = [UIColor systemGreenColor];
+            [self.vpnButton setTitle:BHTLocalized(@"LEGACY_LOGIN_VPN_CONNECT_BUTTON",
+                                                  @"Connect via LocalDevVPN")
+                            forState:UIControlStateNormal];
+            break;
+        case BHTVPNStatusOff:
+        default:
+            self.vpnStatusLabel.text = BHTLocalized(
+                @"LEGACY_LOGIN_VPN_STATUS_OFF",
+                @"LocalDevVPN not detected. Connect it before signing in to avoid rate limits.");
+            self.vpnStatusLabel.textColor = [UIColor secondaryLabelColor];
+            [self.vpnButton setTitle:BHTLocalized(@"LEGACY_LOGIN_VPN_CONNECT_BUTTON",
+                                                  @"Connect via LocalDevVPN")
+                            forState:UIControlStateNormal];
+            break;
+    }
+}
+
+// Opens LocalDevVPN (plain app URL when the tunnel is already up, otherwise
+// its enable URL, localdevvpn://enable?scheme=twitter, which starts the
+// loopback tunnel and bounces back here). No LSApplicationQueriesSchemes
+// entry is needed: -openURL: works without one, and the completion handler
+// tells us when the app isn't installed.
+- (void)openLocalDevVPN {
+    BHTVPNStatus status = LocalDevVPNStatus();
+    NSURL* url = [NSURL URLWithString:(status == BHTVPNStatusLocalDev ? kLocalDevVPNAppURL
+                                                                      : kLocalDevVPNEnableURL)];
+    if (!url) {
+        return;
+    }
+    __weak typeof(self) ws = self;
+    [[UIApplication sharedApplication] openURL:url
+                                       options:@{}
+                             completionHandler:^(BOOL success) {
+                                 if (!success) {
+                                     dispatch_async(dispatch_get_main_queue(), ^{
+                                         [ws showLocalDevVPNMissing];
+                                     });
+                                 }
+                             }];
+}
+
+- (void)showLocalDevVPNMissing {
+    NSString* msg = BHTLocalized(
+        @"LEGACY_LOGIN_VPN_MISSING_MESSAGE",
+        ([NSString stringWithFormat:@"LocalDevVPN isn't installed, so the tunnel can't be started "
+                                    @"from here. Get it free on the App Store (%@) or from %@, "
+                                    @"connect it, then return and try logging in again.",
+                                    kLocalDevVPNAppStoreURL, kLocalDevVPNRepoURL]));
+    [self alert:BHTLocalized(@"LEGACY_LOGIN_VPN_MISSING_TITLE", @"LocalDevVPN not installed")
+            msg:msg];
+}
+
+- (void)vpnButtonTapped {
+    [self refreshVPNStatus];
+    [self openLocalDevVPN];
+}
+
+- (void)showVPNPreflight {
+    NSString* title = BHTLocalized(@"LEGACY_LOGIN_VPN_NEEDED_TITLE", @"VPN not detected");
+    NSString* msg = BHTLocalized(
+        @"LEGACY_LOGIN_VPN_NEEDED_MESSAGE",
+        @"LocalDevVPN doesn't appear to be connected. Twitter rate-limits password logins per "
+        @"network (error 243); signing in through the tunnel keeps retries off your direct "
+        @"connection. Connect LocalDevVPN first?");
+    UIAlertController* sheet =
+        [UIAlertController alertControllerWithTitle:title
+                                            message:msg
+                                     preferredStyle:UIAlertControllerStyleAlert];
+    __weak typeof(self) ws = self;
+    [sheet addAction:[UIAlertAction
+                         actionWithTitle:BHTLocalized(@"LEGACY_LOGIN_VPN_CONNECT_BUTTON",
+                                                      @"Connect via LocalDevVPN")
+                                   style:UIAlertActionStyleDefault
+                                 handler:^(__unused UIAlertAction* _a) {
+                                     [ws openLocalDevVPN];
+                                 }]];
+    [sheet addAction:[UIAlertAction
+                         actionWithTitle:BHTLocalized(@"LEGACY_LOGIN_VPN_CONTINUE", @"Continue anyway")
+                                   style:UIAlertActionStyleDefault
+                                 handler:^(__unused UIAlertAction* _a) {
+                                     ws.vpnPreflightPassed = YES;
+                                     [ws startLogin];
+                                 }]];
+    [sheet addAction:[UIAlertAction
+                         actionWithTitle:BHTLocalized(@"LEGACY_LOGIN_VPN_CONTINUE_SILENT",
+                                                      @"Continue & don't ask again")
+                                   style:UIAlertActionStyleDefault
+                                 handler:^(__unused UIAlertAction* _a) {
+                                     [[NSUserDefaults standardUserDefaults]
+                                         setBool:YES
+                                          forKey:kVPNPreflightSkipKey];
+                                     ws.vpnPreflightPassed = YES;
+                                     [ws startLogin];
+                                 }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:BHTLocalized(@"CANCEL_ACTION_LABEL", @"Cancel")
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+    [self presentViewController:sheet animated:YES completion:nil];
+}
 
 - (void)cancelTapped {
     [self dismissViewControllerAnimated:YES completion:nil];
@@ -409,6 +713,17 @@ static NSString* const kJSInstJS =
                         localizedStringForKey:@"LEGACY_LOGIN_MISSING_INPUT_MESSAGE"]];
         return;
     }
+
+    // LocalDevVPN preflight: password logins are per-IP rate-limited (api 243)
+    // and a loopback tunnel keeps retries off the direct connection. Nudge
+    // once per install unless the user opts out below; explicit retries
+    // (vpnPreflightPassed) skip it.
+    if (!self.vpnPreflightPassed && LocalDevVPNStatus() == BHTVPNStatusOff &&
+        ![[NSUserDefaults standardUserDefaults] boolForKey:kVPNPreflightSkipKey]) {
+        [self showVPNPreflight];
+        return;
+    }
+    self.vpnPreflightPassed = YES;
 
     [self showHUD:[[BHTBundle sharedBundle] localizedStringForKey:@"LEGACY_LOGIN_VERIFYING_STATUS"]];
 
@@ -652,8 +967,29 @@ static NSString* const kJSInstJS =
 - (NSString*)errorText:(id)error {
     if ([error isKindOfClass:[NSError class]]) {
         NSError* e = error;
-        return [NSString
-            stringWithFormat:@"%@ (%ld)\n%@", e.domain, (long)e.code, [e.userInfo description] ?: @""];
+        long apiCode = 0;
+        NSString* apiMessage = nil;
+        CollectAPIError(e, &apiCode, &apiMessage, 0);
+
+        // Prefer the server's own message ("Sorry, that page does not exist.")
+        // over a raw userInfo dump.
+        if (apiMessage.length || apiCode != 0) {
+            if (apiMessage.length && apiCode != 0) {
+                return [NSString stringWithFormat:@"%@ (code %ld, HTTP %ld)", apiMessage,
+                                                  apiCode, (long)e.code];
+            } else if (apiMessage.length) {
+                return [NSString stringWithFormat:@"%@ (HTTP %ld)", apiMessage, (long)e.code];
+            } else {
+                return [NSString stringWithFormat:@"Twitter error %ld (HTTP %ld)", apiCode,
+                                                  (long)e.code];
+            }
+        }
+
+        NSString* desc = e.localizedDescription;
+        if (desc.length && ![desc isEqualToString:e.domain]) {
+            return [NSString stringWithFormat:@"%@ (%@ %ld)", desc, e.domain, (long)e.code];
+        }
+        return [NSString stringWithFormat:@"%@ (%ld)", e.domain, (long)e.code];
     }
 
     return error ? [error description]
@@ -663,29 +999,110 @@ static NSString* const kJSInstJS =
 - (void)alertError:(id)err title:(NSString*)title {
     NSString* details = [self errorText:err];
 
+    // When no tunnel is up, point at LocalDevVPN so retries happen through it
+    // instead of burning the direct connection (per-IP error 243).
+    NSString* vpnHint = nil;
+    if (LocalDevVPNStatus() == BHTVPNStatusOff) {
+        vpnHint = BHTLocalized(
+            @"LEGACY_LOGIN_VPN_HINT",
+            @"Tip: connect LocalDevVPN, then retry — the tunnel keeps login attempts off your "
+            @"direct connection.");
+    }
+
     if (IsRateLimit(err)) {
         NSString* msg =
             [NSString stringWithFormat:[[BHTBundle sharedBundle]
                                            localizedStringForKey:@"LEGACY_LOGIN_RATE_LIMITED_MESSAGE"],
                                        details];
-        [self alert:[[BHTBundle sharedBundle] localizedStringForKey:@"LEGACY_LOGIN_RATE_LIMITED_TITLE"]
-                msg:msg];
+        if (vpnHint) {
+            msg = [msg stringByAppendingFormat:@"\n\n%@", vpnHint];
+        }
+        [self alertLoginError:[[BHTBundle sharedBundle]
+                                  localizedStringForKey:@"LEGACY_LOGIN_RATE_LIMITED_TITLE"]
+                          msg:msg];
         return;
     }
 
-    [self alert:title msg:details];
+    long apiCode = 0;
+    NSString* apiMessage = nil;
+    CollectAPIError(err, &apiCode, &apiMessage, 0);
+    long http = HTTPStatus(err);
+
+    // 404 + api 34 ("Sorry, that page does not exist."): the xauth_password
+    // endpoint this form posts to is gone/blocked for this app build
+    // (commonly attestation-gated server-side). A raw
+    // "com.twitter.TFSTwitterAPICommand (404) {...}" dump leaves users
+    // stuck, so explain and suggest next steps instead.
+    if (http == 404 || apiCode == 34) {
+        NSString* serverMsg = apiMessage.length ? apiMessage : details;
+        NSString* format = BHTLocalized(
+            @"LEGACY_LOGIN_ENDPOINT_GONE_MESSAGE",
+            @"Twitter refused the password-login request (%@).\n\nThis usually means this "
+            @"version of the app can no longer reach Twitter's password-login endpoint "
+            @"(retired or gated behind app attestation), not that your username/password is "
+            @"wrong.\n\nTry: update NeoFreeBird + the app to a matching supported pair, log "
+            @"in once in the official App Store app, then return here — or connect LocalDevVPN "
+            @"and retry. Repeated retries can rate-limit the account.");
+        NSString* msg = [NSString stringWithFormat:format, serverMsg];
+        if (vpnHint) {
+            msg = [msg stringByAppendingFormat:@"\n\n%@", vpnHint];
+        }
+        [self alertLoginError:title msg:msg];
+        return;
+    }
+
+    // Wrong credentials / bad token (api 32/99/215 etc.): keep the server text
+    // but don't bury it in a raw NSError dump.
+    if (apiCode == 32 || apiCode == 99 || apiCode == 215 || http == 401 || http == 403) {
+        NSString* format = BHTLocalized(@"LEGACY_LOGIN_SERVER_REJECTED_MESSAGE",
+                                        @"Twitter rejected the login (%@).\n\nDouble-check the "
+                                        @"username and password (usernames are case-insensitive, "
+                                        @"passwords are not). If the account uses Google/Apple "
+                                        @"sign-in, add a password to it first.");
+        [self alertLoginError:title msg:[NSString stringWithFormat:format, details]];
+        return;
+    }
+
+    [self alertLoginError:title msg:details];
+}
+
+// Login failures get Retry + VPN actions; everything else keeps the plain OK
+// alert below. Retrying re-runs the full flow (fresh ui_metrics + command),
+// and the VPN action jumps straight to LocalDevVPN's enable URL.
+- (void)alertLoginError:(NSString*)title msg:(NSString*)message {
+    UIAlertController* alert =
+        [UIAlertController alertControllerWithTitle:title
+                                            message:message
+                                     preferredStyle:UIAlertControllerStyleAlert];
+    __weak typeof(self) ws = self;
+    [alert addAction:[UIAlertAction actionWithTitle:BHTLocalized(@"LEGACY_LOGIN_RETRY_ACTION",
+                                                                 @"Retry login")
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction* _a) {
+                                                // Explicit retry: don't re-show the preflight.
+                                                ws.vpnPreflightPassed = YES;
+                                                [ws startLogin];
+                                            }]];
+    [alert addAction:[UIAlertAction actionWithTitle:BHTLocalized(@"LEGACY_LOGIN_VPN_CONNECT_BUTTON",
+                                                                 @"Connect via LocalDevVPN")
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction* _a) {
+                                                [ws openLocalDevVPN];
+                                            }]];
+    [alert addAction:[UIAlertAction actionWithTitle:BHTLocalized(@"OK_ACTION_LABEL", @"OK")
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 - (void)alert:(NSString*)title msg:(NSString*)message {
     UIAlertController* alert =
         [UIAlertController alertControllerWithTitle:title
-                                            message:message
-                                     preferredStyle:UIAlertControllerStyleAlert];
-    [alert
-        addAction:[UIAlertAction actionWithTitle:[[BHTBundle sharedBundle]
-                                                     localizedTwitterStringForKey:@"OK_ACTION_LABEL"]
-                                           style:UIAlertActionStyleDefault
-                                         handler:nil]];
+                                             message:message
+                                      preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:BHTLocalized(@"OK_ACTION_LABEL", @"OK")
+                                             style:UIAlertActionStyleDefault
+                                           handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 

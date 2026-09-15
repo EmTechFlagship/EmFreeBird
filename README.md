@@ -3,8 +3,8 @@
 
 
  > [!WARNING]
- > <b>Please do not make issues on logging in.</b> Twitter has currently sealed off all login paths without attestation, so you will not be able to log in. This is a Twitter issue, not a NeoFreeBird issue. 
-
+ > <b>Please do not make issues on logging in.</b> Twitter has currently sealed off all login paths without attestation, so you will not be able to log in. This is a Twitter issue, not a NeoFreeBird issue.
+ > The legacy login screen can use [LocalDevVPN](https://github.com/jkcoxson/LocalDevVPN) (`localdevvpn://enable`): it shows tunnel status, nudges before signing in, and offers retry-through-VPN actions on failures such as rate-limit 243. 
 
   # NeoFreeBird-BHTwitter
   <i>The ultimate way to tweak your Twitter/X experience.</i>

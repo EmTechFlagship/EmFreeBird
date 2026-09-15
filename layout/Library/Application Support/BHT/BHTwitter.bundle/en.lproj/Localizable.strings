@@ -390,6 +390,21 @@
 "LEGACY_LOGIN_NO_ACCOUNT_MESSAGE" = "No account was returned.";
 "LEGACY_LOGIN_RATE_LIMITED_TITLE" = "Likely rate limited (243)";
 "LEGACY_LOGIN_RATE_LIMITED_MESSAGE" = "Too many attempts. Wait a while or switch network/VPN, then try again.\n\nDetails:\n%@";
+"LEGACY_LOGIN_ENDPOINT_GONE_MESSAGE" = "Twitter refused the password-login request (%@).\n\nThis usually means this version of the app can no longer reach Twitter's password-login endpoint (retired or gated behind app attestation), not that your username/password is wrong.\n\nTry: update NeoFreeBird + the app to a matching supported pair, log in once in the official App Store app, then return here — or connect LocalDevVPN and retry. Repeated retries can rate-limit the account.";
+"LEGACY_LOGIN_SERVER_REJECTED_MESSAGE" = "Twitter rejected the login (%@).\n\nDouble-check the username and password (usernames are case-insensitive, passwords are not). If the account uses Google/Apple sign-in, add a password to it first.";
+"LEGACY_LOGIN_VPN_STATUS_CONNECTED" = "LocalDevVPN: connected — login will go through the tunnel.";
+"LEGACY_LOGIN_VPN_STATUS_OTHER" = "VPN: connected (not LocalDevVPN).";
+"LEGACY_LOGIN_VPN_STATUS_OFF" = "LocalDevVPN not detected. Connect it before signing in to avoid rate limits.";
+"LEGACY_LOGIN_VPN_CONNECT_BUTTON" = "Connect via LocalDevVPN";
+"LEGACY_LOGIN_VPN_OPEN_BUTTON" = "Open LocalDevVPN";
+"LEGACY_LOGIN_VPN_NEEDED_TITLE" = "VPN not detected";
+"LEGACY_LOGIN_VPN_NEEDED_MESSAGE" = "LocalDevVPN doesn't appear to be connected. Twitter rate-limits password logins per network (error 243); signing in through the tunnel keeps retries off your direct connection. Connect LocalDevVPN first?";
+"LEGACY_LOGIN_VPN_CONTINUE" = "Continue anyway";
+"LEGACY_LOGIN_VPN_CONTINUE_SILENT" = "Continue & don't ask again";
+"LEGACY_LOGIN_VPN_MISSING_TITLE" = "LocalDevVPN not installed";
+"LEGACY_LOGIN_VPN_MISSING_MESSAGE" = "LocalDevVPN isn't installed, so the tunnel can't be started from here. Get it free on the App Store (https://apps.apple.com/us/app/localdevvpn/id6755608044) or from https://github.com/jkcoxson/LocalDevVPN, connect it, then return and try logging in again.";
+"LEGACY_LOGIN_VPN_HINT" = "Tip: connect LocalDevVPN, then retry — the tunnel keeps login attempts off your direct connection.";
+"LEGACY_LOGIN_RETRY_ACTION" = "Retry login";
 "LEGACY_LOGIN_UNKNOWN_ERROR" = "Unknown error";
 
 "DOWNLOAD_ACTIVITY_VIEW_LABEL" = "Download media";
